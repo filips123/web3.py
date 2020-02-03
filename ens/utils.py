@@ -6,6 +6,7 @@ from typing import (
     Any,
     Callable,
     Collection,
+    Dict,
     Optional,
     Type,
     TypeVar,
@@ -13,6 +14,7 @@ from typing import (
     cast,
 )
 
+import content_hash
 from eth_typing import (
     Address,
     ChecksumAddress,
@@ -35,10 +37,13 @@ from ens.constants import (
     AUCTION_START_GAS_MARGINAL,
     EMPTY_ADDR_HEX,
     EMPTY_SHA3_BYTES,
+    RESOLVER_EIP1577_INTERFACE,
+    RESOLVER_LEGACY_INTERFACE,
     REVERSE_REGISTRAR_DOMAIN,
 )
 from ens.exceptions import (
     InvalidName,
+    NonStandardResolver,
 )
 
 default = object()
@@ -46,6 +51,9 @@ default = object()
 
 if TYPE_CHECKING:
     from web3 import Web3 as _Web3  # noqa: F401
+    from web3.contract import (  # noqa: F401
+        Contract,
+    )
     from web3.providers import (  # noqa: F401
         BaseProvider,
     )
@@ -220,3 +228,52 @@ def assert_signer_in_modifier_kwargs(modifier_kwargs: Any) -> ChecksumAddress:
 
 def is_none_or_zero_address(addr: Union[Address, ChecksumAddress, HexAddress]) -> bool:
     return not addr or addr == EMPTY_ADDR_HEX
+
+
+def resolve_content_record(
+    resolver: 'Contract', name: str
+) -> Optional[Dict[str, str]]:
+    is_eip1577 = resolver.functions.supportsInterface(RESOLVER_EIP1577_INTERFACE).call()
+    is_legacy = resolver.functions.supportsInterface(RESOLVER_LEGACY_INTERFACE).call()
+
+    namehash = normal_name_to_hash(name)
+
+    if is_eip1577:
+        raw_content_hash = resolver.functions.contenthash(namehash).call().hex()
+
+        if is_none_or_zero_address(raw_content_hash):
+            return None
+
+        decoded_content_hash = content_hash.decode(raw_content_hash)
+        type_content_hash = content_hash.get_codec(raw_content_hash)
+
+        return {
+            'type': type_content_hash,
+            'hash': decoded_content_hash,
+        }
+
+    if is_legacy:
+        content = resolver.functions.content(namehash).call()
+
+        if is_none_or_zero_address(content):
+            return None
+
+        return {
+            'type': None,
+            'hash': content.hex(),
+        }
+
+    raise NonStandardResolver('Resolver should either supports contenthash() or content()')
+
+
+def resolve_other_record(
+    resolver: 'Contract', get: str, name: str
+) -> Optional[Union[ChecksumAddress, str]]:
+    lookup_function = getattr(resolver.functions, get)
+    namehash = normal_name_to_hash(name)
+    address = lookup_function(namehash).call()
+
+    if is_none_or_zero_address(address):
+        return None
+
+    return address

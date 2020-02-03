@@ -1,5 +1,6 @@
 from typing import (
     TYPE_CHECKING,
+    Dict,
     Optional,
     Sequence,
     Tuple,
@@ -7,6 +8,7 @@ from typing import (
     cast,
 )
 
+import content_hash
 from eth_typing import (
     Address,
     ChecksumAddress,
@@ -24,11 +26,15 @@ from hexbytes import (
 from ens import abis
 from ens.constants import (
     EMPTY_ADDR_HEX,
+    EMPTY_SHA3_BYTES,
     ENS_PUBLIC_ADDR,
+    RESOLVER_EIP1577_INTERFACE,
+    RESOLVER_LEGACY_INTERFACE,
     REVERSE_REGISTRAR_DOMAIN,
 )
 from ens.exceptions import (
     AddressMismatch,
+    NonStandardResolver,
     UnauthorizedError,
     UnownedName,
 )
@@ -44,6 +50,8 @@ from ens.utils import (
     normal_name_to_hash,
     normalize_name,
     raw_name_to_hash,
+    resolve_content_record,
+    resolve_other_record,
 )
 
 if TYPE_CHECKING:
@@ -111,6 +119,16 @@ class ENS:
         """
         return cast(ChecksumAddress, self.resolve(name, 'addr'))
 
+    def content(self, name: str) -> Optional[Dict[str, str]]:
+        """
+        Look up the content record that `name` currently stores.
+
+        :param str name: an ENS name to look up
+        :raises InvalidName: if `name` has invalid syntax
+        :raises NonStandardResolver: if resolver has not standard interface
+        """
+        return self.resolve(name, 'content')
+
     def name(self, address: ChecksumAddress) -> str:
         """
         Look up the name that the address points to, using a
@@ -165,6 +183,66 @@ class ENS:
         return resolver.functions.setAddr(raw_name_to_hash(name), address).transact(transact)
 
     @dict_copy
+    def setup_content(
+        self,
+        name: str,
+        content: Dict[str, str],
+        transact: "TxParams"={}
+    ) -> HexBytes:
+        """
+        Set up the name to store the supplied content record.
+        The sender of the transaction must own the name, or
+        its parent name.
+
+        :param str name: ENS name to set up
+        :param dict content: content to set up, with `type` and `hash` in content hash format.
+            If resolver does not support EIP 1577, `type` is ignored and `hash` is set as HEX value.
+            If ``{}``, erase the record.
+        :param dict transact: the transaction configuration, like in
+            :meth:`~web3.eth.Eth.sendTransaction`
+        :raises InvalidName: if ``name`` has invalid syntax
+        :raises UnauthorizedError: if ``'from'`` in `transact` does not own `name`
+        """
+        owner = self.setup_owner(name, transact=transact)
+        self._assert_control(owner, name)
+
+        current = self.content(name)
+        if current == content or (not current and not content):
+            return None
+
+        transact['from'] = owner
+        resolver: 'Contract' = self._set_resolver(name, transact=transact)
+
+        is_eip1577 = resolver.functions.supportsInterface(RESOLVER_EIP1577_INTERFACE).call()
+        is_legacy = resolver.functions.supportsInterface(RESOLVER_LEGACY_INTERFACE).call()
+
+        if is_eip1577:
+            if not content:
+                value = ''
+            else:
+                value = content_hash.encode(content['type'], content['hash'])
+
+            return resolver.functions.setContenthash(
+                raw_name_to_hash(name),
+                value
+            ).transact(transact)
+
+        if is_legacy:
+            if not content:
+                value = EMPTY_SHA3_BYTES.hex()
+            else:
+                value = '0x' + content['hash']
+
+            return resolver.functions.setContent(
+                raw_name_to_hash(name),
+                value
+            ).transact(transact)
+
+        raise NonStandardResolver(
+            'Resolver should either supports setContenthash() or setContent()'
+        )
+
+    @dict_copy
     def setup_name(
         self, name: str, address: ChecksumAddress=None, transact: "TxParams"={}
     ) -> HexBytes:
@@ -209,16 +287,16 @@ class ENS:
                 self.setup_address(name, address, transact=transact)
             return self._setup_reverse(name, address, transact=transact)
 
-    def resolve(self, name: str, get: str='addr') -> Optional[Union[ChecksumAddress, str]]:
+    def resolve(
+        self, name: str, get: str='addr'
+    ) -> Optional[Union[ChecksumAddress, Dict[str, str], str]]:
         normal_name = normalize_name(name)
         resolver = self.resolver(normal_name)
         if resolver:
-            lookup_function = getattr(resolver.functions, get)
-            namehash = normal_name_to_hash(normal_name)
-            address = lookup_function(namehash).call()
-            if is_none_or_zero_address(address):
-                return None
-            return lookup_function(namehash).call()
+            if get == 'content' or get == 'contenthash':
+                return resolve_content_record(resolver, normal_name)
+            else:
+                return resolve_other_record(resolver, get, normal_name)
         else:
             return None
 
